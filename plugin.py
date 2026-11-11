@@ -19,7 +19,9 @@ Version:    0.0.1: alpha
                     Python 3.13) with a minimal NUT client built on the standard socket module. Responses are
                     buffered (they may arrive in chunks), every read has a deadline, and the connection is always
                     closed (LOGOUT + close), also after errors. A partial or malformed response no longer updates
-                    any device. Devices, units and parameters are unchanged. (fork by arturpzol)
+                    any device. A communication error on the first poll now also marks the status device as
+                    timed out. USERNAME/PASSWORD values are quoted when needed (spaces, quotes).
+                    Devices, units and parameters are unchanged. (fork by arturpzol)
 """
 """
 <plugin key="NUT_UPS" name="UPS Monitor" author="logread" version="0.3.0" wikilink="http://www.domoticz.com/wiki/plugins/NUT_UPS.html" externallink="http://networkupstools.org/">
@@ -46,7 +48,6 @@ from datetime import datetime, timedelta
 
 class NUTError(Exception):
     """Communication or protocol error while talking to the NUT server (upsd)."""
-    pass
 
 
 class NUTClient:
@@ -82,21 +83,25 @@ class NUTClient:
             self.healthy = False
             raise NUTError("Send failed: {}".format(errorcode))
 
-    def read_until(self, marker, timeout=None):
+    def read_until(self, marker, timeout=None, deadline=None):
         """Return the received data up to and including marker (bytes).
 
-        Data received after the marker stays buffered for the next call. Unlike telnetlib, a timeout
-        or a closed connection raises NUTError instead of silently returning partial data.
+        The wait ends at deadline (time.monotonic() value) if given, else after timeout seconds
+        (default: read_timeout). Data received after the marker stays buffered for the next call.
+        Unlike telnetlib, a timeout or a closed connection raises NUTError instead of silently
+        returning partial data.
         """
-        if timeout is None:
-            timeout = self.read_timeout
-        deadline = time.monotonic() + timeout
+        if deadline is None:
+            deadline = time.monotonic() + (self.read_timeout if timeout is None else timeout)
         while True:
             index = self.buffer.find(marker)
             if index >= 0:
                 end = index + len(marker)
                 data, self.buffer = self.buffer[:end], self.buffer[end:]
                 return data
+            if len(self.buffer) > self.MAX_BUFFER:
+                self.healthy = False
+                raise NUTError("Response from NUT server too large")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.healthy = False
@@ -113,13 +118,11 @@ class NUTClient:
                 self.healthy = False
                 raise NUTError("Connection closed by NUT server")
             self.buffer += chunk
-            if len(self.buffer) > self.MAX_BUFFER:
-                self.healthy = False
-                raise NUTError("Response from NUT server too large")
 
-    def read_line(self, timeout=None):
-        """Return one response line as text, without the trailing newline."""
-        return self.read_until(b"\n", timeout).decode("utf-8", errors="replace").rstrip("\r\n")
+    def read_line(self, timeout=None, deadline=None):
+        """Return one response line as text, without the trailing newline (LF or CRLF)."""
+        data = self.read_until(b"\n", timeout, deadline)
+        return data.decode("utf-8", errors="replace").rstrip("\r\n")
 
     def command(self, line):
         """Send a command that is answered by a single "OK ..." line; raise NUTError otherwise."""
@@ -129,48 +132,65 @@ class NUTClient:
             raise NUTError(result)
         return result
 
+    @staticmethod
+    def quote(value):
+        """Quote a command argument if needed (spaces, quotes, backslashes or empty)."""
+        if value and not any(char in value for char in ' "\\\t'):
+            return value
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     def login(self, username, password):
-        self.command("USERNAME {}".format(username))
-        self.command("PASSWORD {}".format(password))
+        self.command("USERNAME {}".format(self.quote(username)))
+        self.command("PASSWORD {}".format(self.quote(password)))
 
     def list_vars(self, ups):
         """Run LIST VAR <ups> and return a dict {variable name: value (str)}.
 
         Raises NUTError on an "ERR ..." reply, an unexpected or malformed reply, or a timeout.
+        The whole variable list must arrive within read_timeout after the BEGIN line, as before.
         """
         self.write("LIST VAR {}".format(ups))
         first = self.read_line()
         if first != "BEGIN LIST VAR {}".format(ups):
             raise NUTError(first)
-        body = self.read_until("END LIST VAR {}\n".format(ups).encode("utf-8"))
-        body = body.decode("utf-8", errors="replace")
-        lines = body.split("\n")[:-2]  # drop the END LIST VAR line and the empty string after it
+        deadline = time.monotonic() + self.read_timeout
+        end = "END LIST VAR {}".format(ups)
         prefix = "VAR {} ".format(ups)
         result = {}
-        for line in lines:
-            line = line.rstrip("\r")
+        while True:
+            line = self.read_line(deadline=deadline)
+            if line == end:
+                return result
             if not line.startswith(prefix):
+                self.healthy = False
                 raise NUTError("Unexpected line in LIST VAR response: {}".format(line))
             name, _, quoted = line[len(prefix):].partition(" ")
-            if len(quoted) < 2 or quoted[0] != '"' or quoted[-1] != '"':
+            try:
+                result[name] = self.unquote(quoted)
+            except ValueError:
+                self.healthy = False
                 raise NUTError("Malformed line in LIST VAR response: {}".format(line))
-            result[name] = self.unescape(quoted[1:-1])
-        return result
 
     @staticmethod
-    def unescape(value):
-        # upsd escapes backslashes and double quotes inside quoted values
+    def unquote(quoted):
+        """Decode a double-quoted upsd value ("..." with \\" and \\\\ escapes); ValueError if malformed."""
+        if len(quoted) < 2 or quoted[0] != '"':
+            raise ValueError(quoted)
         out = []
         escaped = False
-        for char in value:
+        for index, char in enumerate(quoted[1:], start=1):
             if escaped:
                 out.append(char)
                 escaped = False
             elif char == "\\":
                 escaped = True
+            elif char == '"':
+                if index != len(quoted) - 1:
+                    raise ValueError(quoted)  # unescaped quote inside the value
+                return "".join(out)
             else:
                 out.append(char)
-        return "".join(out)
+        raise ValueError(quoted)  # no closing quote (or it was escaped)
 
     def close(self):
         """Send LOGOUT (best effort) and always close the socket. Never raises.
@@ -181,10 +201,9 @@ class NUTClient:
         if self.sock is None:
             return
         try:
-            healthy = self.healthy
             self.sock.settimeout(self.LOGOUT_TIMEOUT)
             self.sock.sendall(b"LOGOUT\n")
-            if healthy:
+            if self.healthy:
                 self.read_line(self.LOGOUT_TIMEOUT)  # "OK Goodbye"
         except Exception:
             pass
@@ -276,7 +295,6 @@ class BasePlugin:
             try:
                 nut.connect()
             except Exception as errorcode:
-                nut.close()
                 Domoticz.Error("Cannot communicate with NUT Server at {}:{} due to {}".format(
                     Parameters["Address"], Parameters["Port"], errorcode.args))
                 self.error = True
@@ -309,7 +327,9 @@ class BasePlugin:
                 self.alert = 0  # reset alarm level to 0
                 for key in self.variables:
                     Domoticz.Debug("Variable {} = {}".format(self.variables[key][0], self.variables[key][2]))
-                    if self.variables[key][2]:  # skip any variables not reported by the NUT server
+                    # skip any variables not reported by the NUT server, but always flag an error on the
+                    # status device (also when no poll has succeeded yet since the plugin started)
+                    if self.variables[key][2] or (key == "ups.status" and self.error):
                         self.UpdateDevice(key)  # create/update the relevant child devices
 
 

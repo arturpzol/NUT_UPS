@@ -8,6 +8,7 @@ Run from the repository root:  python3 -m unittest discover -s tests -v
 """
 import os
 import re
+import shlex
 import socket
 import sys
 import threading
@@ -166,16 +167,24 @@ class FakeUPSD:
                     line = raw.decode().strip()
                     with self.lock:
                         self.commands.append(line)
-                    words = line.split(" ")
-                    if words[0] == "USERNAME":
-                        username = " ".join(words[1:])
+                    try:
+                        words = shlex.split(line)  # upsd accepts "quoted" arguments with \ escapes
+                    except ValueError:
+                        self._send(conn, b"ERR INVALID-ARGUMENT\n")
+                        continue
+                    if not words:
+                        continue
+                    if words[0] == "USERNAME" and len(words) == 2:
+                        username = words[1]
                         self._send(conn, b"OK\n")
-                    elif words[0] == "PASSWORD":
-                        password = " ".join(words[1:])
+                    elif words[0] == "PASSWORD" and len(words) == 2:
+                        password = words[1]
                         if self.users is None or self.users.get(username) == password:
                             self._send(conn, b"OK\n")
                         else:
                             self._send(conn, b"ERR ACCESS-DENIED\n")
+                    elif words[0] in ("USERNAME", "PASSWORD"):
+                        self._send(conn, b"ERR INVALID-ARGUMENT\n")
                     elif words[:2] == ["LIST", "VAR"] and len(words) == 3:
                         if self.hang_after is not None:
                             self._send(conn, self.hang_after)
@@ -304,6 +313,69 @@ class NUTClientTests(unittest.TestCase):
         finally:
             nut.close()
 
+    def test_crlf_line_endings(self):
+        self.upsd.list_reply = (b"BEGIN LIST VAR ups\r\nVAR ups battery.charge \"99\"\r\n"
+                                b"VAR ups ups.status \"OL\"\r\nEND LIST VAR ups\r\n")
+        nut = self.client()
+        try:
+            self.assertEqual(nut.list_vars("ups"), {"battery.charge": "99", "ups.status": "OL"})
+        finally:
+            nut.close()
+
+    def test_escaped_closing_quote_rejected(self):
+        self.upsd.list_reply = b'BEGIN LIST VAR ups\nVAR ups device.mfr "abc\\"\nEND LIST VAR ups\n'
+        nut = self.client()
+        try:
+            with self.assertRaises(plugin.NUTError):
+                nut.list_vars("ups")
+        finally:
+            nut.close()
+
+    def test_unescaped_inner_quote_rejected(self):
+        self.upsd.list_reply = b'BEGIN LIST VAR ups\nVAR ups device.mfr "a"b"\nEND LIST VAR ups\n'
+        nut = self.client()
+        try:
+            with self.assertRaises(plugin.NUTError):
+                nut.list_vars("ups")
+        finally:
+            nut.close()
+
+    def test_unquote(self):
+        self.assertEqual(plugin.NUTClient.unquote('"a \\"b\\" \\\\ c"'), 'a "b" \\ c')
+        self.assertEqual(plugin.NUTClient.unquote('""'), "")
+        for bad in ['', '"', 'abc', '"abc', '"abc\\"', '"a"b"']:
+            with self.assertRaises(ValueError, msg=bad):
+                plugin.NUTClient.unquote(bad)
+
+    def test_buffer_limit_does_not_reject_complete_response(self):
+        reply = b"BEGIN LIST VAR ups\n"
+        self.upsd.list_reply = reply
+        nut = self.client()
+        nut.MAX_BUFFER = len(reply) - 5  # the whole reply arrives in one chunk, larger than the limit
+        try:
+            nut.write("LIST VAR ups")
+            self.assertEqual(nut.read_line(), "BEGIN LIST VAR ups")
+        finally:
+            nut.close()
+
+    def test_buffer_limit_rejects_endless_response(self):
+        self.upsd.hang_after = b"x" * 5000  # no newline, never ends
+        nut = self.client()
+        nut.MAX_BUFFER = 1000
+        try:
+            nut.write("LIST VAR ups")
+            with self.assertRaises(plugin.NUTError) as ctx:
+                nut.read_line()
+        finally:
+            nut.close()
+        self.assertIn("too large", str(ctx.exception))
+
+    def test_quote(self):
+        self.assertEqual(plugin.NUTClient.quote("monuser"), "monuser")
+        self.assertEqual(plugin.NUTClient.quote("my secret"), '"my secret"')
+        self.assertEqual(plugin.NUTClient.quote('a"b\\c'), '"a\\"b\\\\c"')
+        self.assertEqual(plugin.NUTClient.quote(""), '""')
+
     def test_close_sends_logout(self):
         nut = self.client()
         nut.list_vars("ups")
@@ -404,6 +476,15 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.upsd.commands[:3], ["USERNAME monuser", "PASSWORD secret", "LIST VAR ups"])
         self.assertEqual(DEVICES[1].sValue, "ONLINE CHARGING")
 
+    def test_authentication_with_special_characters(self):
+        plugin.Parameters["Username"] = "mon user"
+        plugin.Parameters["Password"] = 'my "secret" \\ pw'
+        self.upsd.users = {"mon user": 'my "secret" \\ pw'}
+        self.poll()
+        self.assertEqual(LOG["error"], [])
+        self.assertEqual(self.upsd.commands[:2], ['USERNAME "mon user"', 'PASSWORD "my \\"secret\\" \\\\ pw"'])
+        self.assertEqual(DEVICES[1].sValue, "ONLINE CHARGING")
+
     def test_authentication_failure(self):
         plugin.Parameters["Username"] = "monuser"
         plugin.Parameters["Password"] = "wrong"
@@ -443,6 +524,14 @@ class PluginTests(unittest.TestCase):
         self.poll()
         self.assertEqual(DEVICES[1].sValue, "ONLINE CHARGING")
         self.assertFalse(DEVICES[1].TimedOut)
+
+    def test_error_on_first_poll_flags_status_device(self):
+        plugin.Parameters["Mode1"] = "wrongname"
+        self.poll()
+        self.assertEqual(LOG["error"], ["Error reading UPS variables: ERR UNKNOWN-UPS"])
+        self.assertEqual(DEVICES[1].sValue, "COMMUNICATION ERROR")
+        self.assertTrue(DEVICES[1].TimedOut)
+        self.assertEqual(sorted(DEVICES), [1])  # no value devices created from a failed poll
 
     def test_partial_response_does_not_update_devices(self):
         self.poll()
